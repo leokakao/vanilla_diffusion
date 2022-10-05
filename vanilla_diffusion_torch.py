@@ -1,4 +1,141 @@
-# Training Loop & forward backward
+from PIL import Image
+import blobfile as bf
+import numpy as np
+from abc import ABC, abstractmethod
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+
+def load_data(
+    *, data_dir, batch_size, image_size, class_cond=False, deterministic=False
+):
+    """
+    For a dataset, create a generator over (images, kwargs) pairs.
+    Each images is an NCHW float tensor, and the kwargs dict contains zero or
+    more keys, each of which map to a batched Tensor of their own.
+    The kwargs dict can be used for class labels, in which case the key is "y"
+    and the values are integer tensors of class labels.
+    :param data_dir: a dataset directory.
+    :param batch_size: the batch size of each returned pair.
+    :param image_size: the size to which images are resized.
+    :param class_cond: if True, include a "y" key in returned dicts for class
+                       label. If classes are not available and this is true, an
+                       exception will be raised.
+    :param deterministic: if True, yield results in a deterministic order.
+    """
+    if not data_dir:
+        raise ValueError("unspecified data directory")
+    all_files = _list_image_files_recursively(data_dir)
+    classes = None
+    if class_cond:
+        # Assume classes are the first part of the filename,
+        # before an underscore.
+        class_names = [bf.basename(path).split("_")[0] for path in all_files]
+        sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+        classes = [sorted_classes[x] for x in class_names]
+    dataset = ImageDataset(
+        image_size,
+        all_files,
+        classes=classes,
+    )
+    if deterministic:
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
+        )
+    else:
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True
+        )
+    while True:
+        yield from loader
+
+
+def _list_image_files_recursively(data_dir):
+    results = []
+    for entry in sorted(bf.listdir(data_dir)):
+        full_path = bf.join(data_dir, entry)
+        ext = entry.split(".")[-1]
+        if "." in entry and ext.lower() in ["jpg", "jpeg", "png", "gif"]:
+            results.append(full_path)
+        elif bf.isdir(full_path):
+            results.extend(_list_image_files_recursively(full_path))
+    return results
+
+
+class ImageDataset(Dataset):
+    def __init__(self, resolution, image_paths, classes=None, shard=0, num_shards=1):
+        super().__init__()
+        self.resolution = resolution
+        self.local_images = image_paths[shard:][::num_shards]
+        self.local_classes = None if classes is None else classes[shard:][::num_shards]
+
+    def __len__(self):
+        return len(self.local_images)
+
+    def __getitem__(self, idx):
+        path = self.local_images[idx]
+        with bf.BlobFile(path, "rb") as f:
+            pil_image = Image.open(f)
+            pil_image.load()
+
+        # We are not on a new enough PIL to support the `reducing_gap`
+        # argument, which uses BOX downsampling at powers of two first.
+        # Thus, we do it by hand to improve downsample quality.
+        while min(*pil_image.size) >= 2 * self.resolution:
+            pil_image = pil_image.resize(
+                tuple(x // 2 for x in pil_image.size), resample=Image.BOX
+            )
+
+        scale = self.resolution / min(*pil_image.size)
+        pil_image = pil_image.resize(
+            tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
+        )
+
+        arr = np.array(pil_image.convert("RGB"))
+        crop_y = (arr.shape[0] - self.resolution) // 2
+        crop_x = (arr.shape[1] - self.resolution) // 2
+        arr = arr[crop_y : crop_y + self.resolution, crop_x : crop_x + self.resolution]
+        arr = arr.astype(np.float32) / 127.5 - 1
+
+        out_dict = {}
+        if self.local_classes is not None:
+            out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+        return np.transpose(arr, [2, 0, 1]), out_dict
+
+class ScheduleSampler(ABC):
+    """
+    A distribution over timesteps in the diffusion process, intended to reduce
+    variance of the objective.
+    By default, samplers perform unbiased importance sampling, in which the
+    objective's mean is unchanged.
+    However, subclasses may override sample() to change how the resampled
+    terms are reweighted, allowing for actual changes in the objective.
+    """
+
+    @abstractmethod
+    def weights(self):
+        """
+        Get a numpy array of weights, one per diffusion step.
+        The weights needn't be normalized, but must be positive.
+        """
+
+    def sample(self, batch_size):
+        w = self.weights()
+        p = w / np.sum(w)
+        indices_np = np.random.choice(len(p), size=(batch_size,), p=p)
+        indices = torch.from_numpy(indices_np).long()
+        weights_np = 1 / (len(p) * p[indices_np])
+        weights = torch.from_numpy(weights_np).float()
+        return indices, weights
+
+class UniformSampler(ScheduleSampler):
+    def __init__(self, diffusion):
+        self.diffusion = diffusion
+        self._weights = np.ones([diffusion.num_timesteps])
+
+    def weights(self):
+        return self._weights
+
 
 # model
 from abc import abstractmethod
@@ -855,7 +992,6 @@ def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs
     output = torch.where((t == 0), decoder_nll, kl)
     return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-#def training_losses(self, model, x_start, t):
 
 betas = 0.1
 # Use float64 for accuracy.
@@ -891,6 +1027,17 @@ posterior_mean_coef2 = (
     * np.sqrt(alphas)
     / (1.0 - alphas_cumprod)
 )
+
+data = load_data(
+    data_dir="./",
+    batch_size=1,
+    image_size=64,
+    class_cond=False,
+)
+model
+diffusion
+schedule_sampler = UniformSampler(diffusion)
+t, weights = schedule_sampler.sample(1)
 
 x_start = torch.rand((64,64))
 x_t = q_sample(x_start, t, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
