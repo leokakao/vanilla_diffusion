@@ -1679,6 +1679,12 @@ def zero_module(module):
         p.detach().zero_()
     return module
 
+def mean_flat(tensor):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):

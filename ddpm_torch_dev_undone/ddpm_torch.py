@@ -20,19 +20,12 @@ for epoch in range(100):
         micro = batch[i : i + microbatch]
         micro_cond = {k: v[i : i+microbatch] for k, v in cond.items()}
         last_batch = (i + microbatch) >= batch_shape0
-        t, weights = schedule_sampler.sample(microbatch)  
+        t, weights = schedule_sampler.sample(microbatch)
+        diffusion.training_losses(model, micro, t, model_kwargs=micro_cond)
 
 def forward_backward(self, batch, cond):
     
     for i in range(0, batch.shape[0], self.microbatch):
-
-        compute_losses = functools.partial(
-            self.diffusion.training_losses,
-            self.ddp_model,
-            micro,
-            t,
-            model_kwargs=micro_cond,
-        )
 
         if last_batch or not self.use_ddp:
             losses = compute_losses()
